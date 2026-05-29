@@ -217,6 +217,7 @@ def get_state() -> dict[str, Any]:
     state.setdefault("location_lock_country_short", "")
     state.setdefault("location_lock_location", "")
     state.setdefault("location_lock_label", "")
+    state.setdefault("residential_ip_lock_enabled", False)
     
     # Pre-populate settings inputs in UI
     ui_cfg = load_ui_config()
@@ -663,6 +664,31 @@ def node_matches_location_lock(node: dict[str, Any], location_lock: Optional[dic
 
     return not strict_location
 
+def get_residential_ip_lock() -> bool:
+    state = get_state()
+    return bool(state.get("residential_ip_lock_enabled"))
+
+def set_residential_ip_lock(enabled: bool) -> None:
+    set_state(
+        residential_ip_lock_enabled=enabled,
+        last_check_message="已锁定自动切换为住宅 IP 节点" if enabled else "已取消住宅 IP 自动切换锁定",
+    )
+
+def is_residential_ip_node(node: dict[str, Any]) -> bool:
+    return normalize_location_value(node.get("ip_type")) == "residential"
+
+def node_matches_residential_ip_lock(node: dict[str, Any], enabled: Optional[bool] = None, strict_ip_type: bool = True) -> bool:
+    if enabled is None:
+        enabled = get_residential_ip_lock()
+    if not enabled:
+        return True
+
+    ip_type = normalize_location_value(node.get("ip_type"))
+    if ip_type:
+        return ip_type == "residential"
+
+    return not strict_ip_type
+
 active_test_indexes = set()
 test_indexes_lock = threading.Lock()
 
@@ -842,6 +868,7 @@ def auto_switch_node(attempt: int = 0) -> None:
         
     # Find the next best available node
     location_lock = get_location_lock()
+    residential_ip_lock = get_residential_ip_lock()
     with lock:
         nodes = read_json(NODES_FILE, [])
         candidates = [
@@ -849,6 +876,7 @@ def auto_switch_node(attempt: int = 0) -> None:
             if n.get("probe_status") == "available" 
             and not n.get("active")
             and node_matches_location_lock(n, location_lock, strict_location=True)
+            and node_matches_residential_ip_lock(n, residential_ip_lock, strict_ip_type=True)
         ]
         candidates.sort(key=lambda n: (parse_int(n.get("latency_ms")) or 999999, -parse_int(n.get("score"))))
         
@@ -1019,10 +1047,19 @@ def maintain_valid_nodes(force: bool = False) -> str:
             return "没有拉取到新节点"
 
         location_lock = get_location_lock()
+        residential_ip_lock = get_residential_ip_lock()
         if location_lock.get("enabled"):
             candidates.sort(
                 key=lambda n: (
                     0 if node_matches_location_lock(n, location_lock, strict_location=False) else 1,
+                    -parse_int(n.get("score")),
+                    parse_int(n.get("ping")),
+                )
+            )
+        if residential_ip_lock:
+            candidates.sort(
+                key=lambda n: (
+                    0 if is_residential_ip_node(n) else 1 if not normalize_location_value(n.get("ip_type")) else 2,
                     -parse_int(n.get("score")),
                     parse_int(n.get("ping")),
                 )
@@ -1067,6 +1104,11 @@ def maintain_valid_nodes(force: bool = False) -> str:
                 to_test_candidates = [
                     n for n in to_test_candidates
                     if node_matches_location_lock(n, location_lock, strict_location=False)
+                ]
+            if residential_ip_lock:
+                to_test_candidates = [
+                    n for n in to_test_candidates
+                    if node_matches_residential_ip_lock(n, residential_ip_lock, strict_ip_type=False)
                 ]
             to_test = to_test_candidates[:10]
             to_test_ids = [n["id"] for n in to_test]
@@ -2184,6 +2226,10 @@ INDEX_HTML = r"""<!doctype html>
     <div id="status" class="status"><span class="status-dot"></span>服务加载中...</div>
   </div>
   <div class="btn-group">
+    <button id="residential_ip_lock" class="btn-primary" style="background: rgba(255, 255, 255, 0.08); border: 1px solid var(--border-color); color: var(--text-primary); max-width: 176px; white-space: nowrap;">
+      <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M3 11l9-7 9 7" /><path stroke-linecap="round" stroke-linejoin="round" d="M5 10v10h14V10" /><path stroke-linecap="round" stroke-linejoin="round" d="M9 20v-6h6v6" /></svg>
+      锁定住宅IP
+    </button>
     <button id="location_lock" class="btn-primary" style="background: rgba(255, 255, 255, 0.08); border: 1px solid var(--border-color); color: var(--text-primary); max-width: 176px; white-space: nowrap;">
       <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M12 11c1.657 0 3-1.343 3-3S13.657 5 12 5 9 6.343 9 8s1.343 3 3 3z" /><path stroke-linecap="round" stroke-linejoin="round" d="M19.5 8.5c0 5.25-7.5 12-7.5 12s-7.5-6.75-7.5-12a7.5 7.5 0 1115 0z" /></svg>
       锁定位置
@@ -2569,6 +2615,20 @@ function stableSortNodes() {
   });
 }
 
+function renderResidentialIpLockButton() {
+  const btn = $("residential_ip_lock");
+  if (!btn) return;
+  const enabled = !!state.residential_ip_lock_enabled;
+  const homeIcon = `<svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M3 11l9-7 9 7" /><path stroke-linecap="round" stroke-linejoin="round" d="M5 10v10h14V10" /><path stroke-linecap="round" stroke-linejoin="round" d="M9 20v-6h6v6" /></svg>`;
+  const lockIcon = `<svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M7 10V8a5 5 0 0110 0v2" /><rect x="5" y="10" width="14" height="10" rx="2" /><path stroke-linecap="round" stroke-linejoin="round" d="M12 14v2" /></svg>`;
+  btn.disabled = !!state.is_connecting;
+  btn.style.background = enabled ? "var(--warning-gradient)" : "rgba(255, 255, 255, 0.08)";
+  btn.style.border = enabled ? "none" : "1px solid var(--border-color)";
+  btn.style.color = enabled ? "white" : "var(--text-primary)";
+  btn.title = enabled ? "自动切换已锁定为住宅 IP 节点，点击取消" : "自动切换时只选择住宅 IP 节点";
+  btn.innerHTML = `${enabled ? lockIcon : homeIcon}${enabled ? "已锁定住宅IP" : "锁定住宅IP"}`;
+}
+
 function getLockDisplayLabel(activeNode) {
   return state.location_lock_label || (activeNode ? (activeNode.location || translateCountry(activeNode.country) || activeNode.country_short || "") : "");
 }
@@ -2594,6 +2654,7 @@ function renderLocationLockButton(activeNode) {
 function render(){
   const activeNodeId = state.active_openvpn_node_id;
   const activeNode = nodes.find(n => n.active || n.id === activeNodeId);
+  renderResidentialIpLockButton();
   renderLocationLockButton(activeNode);
   
   // Render separated Active Node Card
@@ -2985,6 +3046,31 @@ async function load(){
 
 $("search").oninput=()=>{ currentPage = 1; render(); };
 $("country_filter").onchange=()=>{ currentPage = 1; render(); };
+
+$("residential_ip_lock").onclick=async()=>{
+  const enable = !state.residential_ip_lock_enabled;
+  const btn = $("residential_ip_lock");
+  btn.disabled = true;
+  try {
+    const response = await fetch("./api/residential_ip_lock", {
+      method: "POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({enabled: enable})
+    });
+    const result = await response.json();
+    if (!result.ok) {
+      alert(result.error || "住宅 IP 锁定设置失败");
+      return;
+    }
+    state = result.state || state;
+    render();
+  } catch(e) {
+    alert("住宅 IP 锁定请求失败");
+  } finally {
+    btn.disabled = false;
+    render();
+  }
+};
 
 $("location_lock").onclick=async()=>{
   const enable = !state.location_lock_enabled;
@@ -3605,7 +3691,16 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
 
-        if effective_path == "/api/location_lock":
+        if effective_path == "/api/residential_ip_lock":
+            try:
+                length = parse_int(self.headers.get("Content-Length"))
+                payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}") if length > 0 else {}
+                enabled = bool(payload.get("enabled"))
+                set_residential_ip_lock(enabled)
+                self.send_json({"ok": True, "state": get_state()})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        elif effective_path == "/api/location_lock":
             try:
                 length = parse_int(self.headers.get("Content-Length"))
                 payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}") if length > 0 else {}
@@ -3748,6 +3843,7 @@ def main() -> None:
             "location_lock_country_short": previous_state.get("location_lock_country_short", ""),
             "location_lock_location": previous_state.get("location_lock_location", ""),
             "location_lock_label": previous_state.get("location_lock_label", ""),
+            "residential_ip_lock_enabled": bool(previous_state.get("residential_ip_lock_enabled")),
         },
     )
     threading.Thread(target=proxy_server.start_proxy_server, args=(LOCAL_PROXY_HOST, LOCAL_PROXY_PORT), daemon=True).start()
