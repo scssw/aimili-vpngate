@@ -20,7 +20,7 @@ Bilingual: [中文](#中文) | [English](#english)
 
 ### 🚀 快速开始
 
-在您的 **Ubuntu** VPS 机器上，复制并运行以下一行指令即可完成自动安装部署：
+在您的 **Debian 11+ / Ubuntu 20.04+** VPS 机器上，复制并运行以下一行指令即可完成自动安装部署：
 
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/baoweise-bot/aimili-vpngate/main/install.sh)
@@ -43,18 +43,16 @@ bash <(curl -Ls https://raw.githubusercontent.com/baoweise-bot/aimili-vpngate/ma
 
 #### 💡 首次安装与常见报错解决（小白必看）
 
-##### 1. 极简系统缺少依赖（Ubuntu 18-26 / Debian 首次安装）
+##### 1. 极简系统缺少依赖（Debian 11+ / Ubuntu 20.04+ 首次安装）
 如果系统是全新纯净版，可能会因为缺少 `curl` 或 `ca-certificates` 导致一键安装脚本下载失败。请在安装前执行以下命令补充依赖：
 ```bash
 sudo apt-get update && sudo apt-get install -y curl ca-certificates
 ```
 
 ##### 2. Debian 系统兼容运行方法
-本脚本一键包默认限制在 Ubuntu 系统运行。Debian 用户如需运行，可先下载并用 `sed` 临时将系统类型限制替换为 `"ubuntu"` 后再执行安装：
+安装脚本已原生支持 Debian 11 或更高版本，无需再用 `sed` 修改系统类型判断。直接运行一键安装命令即可：
 ```bash
-curl -Ls https://raw.githubusercontent.com/baoweise-bot/aimili-vpngate/main/install.sh -o install.sh
-sed -i 's/"${ID:-}"/"ubuntu"/g' install.sh
-sudo bash install.sh
+bash <(curl -Ls https://raw.githubusercontent.com/baoweise-bot/aimili-vpngate/main/install.sh)
 ```
 
 ##### 3. 包管理器被占用（Apt 锁冲突报错解决）
@@ -127,7 +125,7 @@ sudo apt-get update
 
 ### 🚀 Quick Start
 
-To install and deploy AimiliVPN on your **Ubuntu** server, copy and paste the following command:
+To install and deploy AimiliVPN on your **Debian 11+ / Ubuntu 20.04+** server, copy and paste the following command:
 
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/baoweise-bot/aimili-vpngate/main/install.sh)
@@ -156,12 +154,10 @@ If you are using a brand new minimal OS, the installation might fail due to miss
 sudo apt-get update && sudo apt-get install -y curl ca-certificates
 ```
 
-##### 2. Bypass OS Restrictions for Debian
-The script is restricted to Ubuntu by default. For Debian systems, run the following commands to download, patch, and install:
+##### 2. Debian Support
+The installer now supports Debian 11 or newer directly. No `sed` patch is required:
 ```bash
-curl -Ls https://raw.githubusercontent.com/baoweise-bot/aimili-vpngate/main/install.sh -o install.sh
-sed -i 's/"${ID:-}"/"ubuntu"/g' install.sh
-sudo bash install.sh
+bash <(curl -Ls https://raw.githubusercontent.com/baoweise-bot/aimili-vpngate/main/install.sh)
 ```
 
 ##### 3. Package Manager Locked (`apt`/`dpkg` Lock Errors)
