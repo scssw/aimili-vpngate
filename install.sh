@@ -64,7 +64,7 @@ echo -e "检测到系统: ${GREEN}${PRETTY_NAME:-unknown}${PLAIN}"
 
 # 3. Configure GitHub Repository URL
 # Default to the official repository (baoweise-bot/aimili-vpngate)
-DEFAULT_USER="baoweise-bot"
+DEFAULT_USER="scssw"
 DEFAULT_REPO="aimili-vpngate"
 
 # Allow custom repository override via command line arguments
