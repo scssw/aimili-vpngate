@@ -10,7 +10,7 @@ import urllib.parse
 import urllib.request
 import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 ROOT_DIR = Path(__file__).resolve().parent
 DATA_DIR = ROOT_DIR / "vpngate_data"
@@ -86,7 +86,7 @@ COUNTRY_TRANSLATIONS = {
     "Luxembourg": "卢森堡",
 }
 
-def get_upstream_proxy() -> tuple[str | None, str | None, int | None]:
+def get_upstream_proxy() -> tuple[Optional[str], Optional[str], Optional[int]]:
     """
     Returns (proxy_type, host, port) from environment variables.
     proxy_type is 'socks' or 'http'.
@@ -165,7 +165,7 @@ def parse_remote(config_text: str, fallback_ip: str = "") -> tuple[str, int, str
             remote_port = int(parts[2]) if parts[2].isdigit() else 0
     return remote_host, remote_port, proto
 
-def get_physical_interface() -> str | None:
+def get_physical_interface() -> Optional[str]:
     try:
         res = subprocess.run(["ip", "route"], capture_output=True, text=True, timeout=2)
         if res.returncode == 0:
@@ -192,7 +192,7 @@ def get_physical_interface() -> str | None:
         pass
     return None
 
-def tcp_latency_ms(host: str, port: int, dev: str | None = None) -> int:
+def tcp_latency_ms(host: str, port: int, dev: Optional[str] = None) -> int:
     started = time.time()
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:

@@ -14,25 +14,57 @@ if [[ "$(id -u)" != "0" ]]; then
     exit 1
 fi
 
-# 2. Check OS distribution (Ubuntu only)
+# 2. Check OS distribution (Debian 11+ / Ubuntu)
 if [ -f /etc/os-release ]; then
     . /etc/os-release
-    if [[ "${ID:-}" != "ubuntu" ]]; then
-        echo -e "${RED}错误: 本系统不是 Ubuntu！目前 AimiliVPN 仅支持 Ubuntu 系统。${PLAIN}"
-        exit 1
+    OS_ID="${ID:-}"
+    OS_VERSION_ID="${VERSION_ID:-0}"
+    OS_MAJOR="${OS_VERSION_ID%%.*}"
+    if [[ -z "$OS_MAJOR" || ! "$OS_MAJOR" =~ ^[0-9]+$ ]]; then
+        OS_MAJOR=0
     fi
+
+    case "$OS_ID" in
+        debian)
+            if [ "$OS_MAJOR" -lt 11 ]; then
+                echo -e "${RED}错误: Debian 版本过低，AimiliVPN 需要 Debian 11 或更高版本。当前版本: ${PRETTY_NAME:-unknown}${PLAIN}"
+                exit 1
+            fi
+            ;;
+        ubuntu)
+            if [ "$OS_MAJOR" -lt 20 ]; then
+                echo -e "${RED}错误: Ubuntu 版本过低，AimiliVPN 需要 Ubuntu 20.04 或更高版本。当前版本: ${PRETTY_NAME:-unknown}${PLAIN}"
+                exit 1
+            fi
+            ;;
+        *)
+            echo -e "${RED}错误: 暂不支持当前系统: ${PRETTY_NAME:-${OS_ID}}。请使用 Debian 11+ 或 Ubuntu 20.04+。${PLAIN}"
+            exit 1
+            ;;
+    esac
 else
     echo -e "${RED}错误: 无法确定操作系统版本，缺少 /etc/os-release 文件。${PLAIN}"
+    exit 1
+fi
+
+if ! command -v apt-get >/dev/null 2>&1; then
+    echo -e "${RED}错误: 未找到 apt-get。请在 Debian/Ubuntu 系统上运行本脚本。${PLAIN}"
+    exit 1
+fi
+
+if ! command -v systemctl >/dev/null 2>&1; then
+    echo -e "${RED}错误: 未找到 systemctl。AimiliVPN 需要 systemd 环境，常见 OpenVZ/LXC 精简容器可能不支持。${PLAIN}"
     exit 1
 fi
 
 echo -e "${BLUE}==========================================================${PLAIN}"
 echo -e "${BLUE}        欢迎使用 AimiliVPN 一键源码部署与管理脚本${PLAIN}"
 echo -e "${BLUE}==========================================================${PLAIN}"
+echo -e "检测到系统: ${GREEN}${PRETTY_NAME:-unknown}${PLAIN}"
 
 # 3. Configure GitHub Repository URL
 # Default to the official repository (baoweise-bot/aimili-vpngate)
-DEFAULT_USER="scssw"
+DEFAULT_USER="baoweise-bot"
 DEFAULT_REPO="aimili-vpngate"
 
 # Allow custom repository override via command line arguments
@@ -43,9 +75,29 @@ GITHUB_URL="https://github.com/${GITHUB_USER}/${GITHUB_REPO}.git"
 
 echo -e "\n${YELLOW}[1/4] 正在安装系统基础依赖...${PLAIN}"
 echo -e "  -> 正在运行 apt-get update 更新软件源清单..."
-apt-get update -q || true
-echo -e "  -> 正在运行 apt-get install 安装基础依赖包 (openvpn, curl, git, iptables, iproute2, psmisc, python3)..."
-apt-get install -y openvpn curl git ca-certificates iptables iproute2 psmisc python3
+if ! apt-get update -q; then
+    echo -e "${RED}错误: apt-get update 失败，请检查软件源、DNS 或 apt/dpkg 锁占用后重试。${PLAIN}"
+    exit 1
+fi
+
+BASE_PACKAGES=(
+    openvpn
+    curl
+    git
+    ca-certificates
+    iptables
+    iproute2
+    iputils-ping
+    psmisc
+    procps
+    python3
+    systemd-sysv
+)
+echo -e "  -> 正在安装基础依赖包: ${BASE_PACKAGES[*]}"
+if ! apt-get install -y --no-install-recommends "${BASE_PACKAGES[@]}"; then
+    echo -e "${RED}错误: 依赖安装失败，请检查 apt 输出后重试。${PLAIN}"
+    exit 1
+fi
 
 # 4. Clone or pull the repository
 INSTALL_DIR="/opt/aimilivpn"
@@ -86,8 +138,9 @@ fi
 
 # 5. Configure Systemd Service (direct python3 run)
 echo -e "\n${YELLOW}[3/4] 正在配置 systemd 系统服务...${PLAIN}"
-echo -e "  -> 正在创建服务配置 /lib/systemd/system/aimilivpn.service ..."
-cat > /lib/systemd/system/aimilivpn.service <<EOF
+SERVICE_FILE="/etc/systemd/system/aimilivpn.service"
+echo -e "  -> 正在创建服务配置 ${SERVICE_FILE} ..."
+cat > "${SERVICE_FILE}" <<EOF
 [Unit]
 Description=AimiliVPN OpenVPN Manager with HTTP/SOCKS5 Proxy
 After=network.target
@@ -471,10 +524,11 @@ def uninstall_service():
         print("正在完全卸载 AimiliVPN...", flush=True)
         subprocess.run(["systemctl", "stop", "aimilivpn.service"])
         subprocess.run(["systemctl", "disable", "aimilivpn.service"])
-        try:
-            os.unlink("/lib/systemd/system/aimilivpn.service")
-        except Exception:
-            pass
+        for service_file in ("/etc/systemd/system/aimilivpn.service", "/lib/systemd/system/aimilivpn.service"):
+            try:
+                os.unlink(service_file)
+            except Exception:
+                pass
         try:
             os.unlink("/usr/bin/ml")
         except Exception:

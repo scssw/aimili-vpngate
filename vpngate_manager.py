@@ -18,7 +18,7 @@ import urllib.request
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 import concurrent.futures
 import sys
 import uuid
@@ -58,7 +58,7 @@ AUTH_FILE = DATA_DIR / "vpngate_auth.txt"
 
 lock = threading.RLock()
 active_sessions: dict[str, float] = {}
-active_openvpn_process: subprocess.Popen[str] | None = None
+active_openvpn_process: Optional[subprocess.Popen[str]] = None
 active_openvpn_node_id = ""
 is_connecting = True
 last_active_ping_time = 0.0
@@ -414,7 +414,7 @@ def openvpn_command(config_file: str, route_nopull: bool, dev: str = "tun0") -> 
         command.append("--route-nopull")
     return command
 
-def stop_process(process: subprocess.Popen[str] | None) -> None:
+def stop_process(process: Optional[subprocess.Popen[str]]) -> None:
     if process is None or process.poll() is not None:
         return
     process.terminate()
@@ -452,7 +452,7 @@ def update_handshake_status(line_lower: str) -> None:
             set_state(active_node_latency=short_status, last_check_message=detailed_desc)
             break
 
-def run_openvpn_until_ready(config_file: str, keep_alive: bool, route_nopull: bool, timeout: int | None = None, dev: str = "tun0") -> tuple[bool, str, subprocess.Popen[str] | None]:
+def run_openvpn_until_ready(config_file: str, keep_alive: bool, route_nopull: bool, timeout: Optional[int] = None, dev: str = "tun0") -> tuple[bool, str, Optional[subprocess.Popen[str]]]:
     limit = timeout if timeout is not None else OPENVPN_TEST_TIMEOUT_SECONDS
     try:
         process = subprocess.Popen(
@@ -469,7 +469,7 @@ def run_openvpn_until_ready(config_file: str, keep_alive: bool, route_nopull: bo
     except OSError as exc:
         return False, f"openvpn start failed: {exc}", None
 
-    lines: queue.Queue[str | None] = queue.Queue()
+    lines: queue.Queue[Optional[str]] = queue.Queue()
     startup_done = [False]
 
     def reader() -> None:
@@ -638,7 +638,7 @@ def clear_location_lock() -> None:
         last_check_message="已取消自动切换地区锁定",
     )
 
-def node_matches_location_lock(node: dict[str, Any], location_lock: dict[str, Any] | None = None, strict_location: bool = True) -> bool:
+def node_matches_location_lock(node: dict[str, Any], location_lock: Optional[dict[str, Any]] = None, strict_location: bool = True) -> bool:
     location_lock = location_lock or get_location_lock()
     if not location_lock.get("enabled"):
         return True

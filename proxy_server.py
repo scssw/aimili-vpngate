@@ -5,7 +5,7 @@ import socket
 import threading
 import urllib.parse
 import time
-from typing import Any
+from typing import Any, Optional
 
 def parse_int(value: Any) -> int:
     try:
@@ -22,7 +22,7 @@ def recv_exact(sock: socket.socket, size: int) -> bytes:
         data += chunk
     return data
 
-def resolve_dns_over_tun0(host: str, dns_server: str = "8.8.8.8", timeout: float = 3.0) -> str | None:
+def resolve_dns_over_tun0(host: str, dns_server: str = "8.8.8.8", timeout: float = 3.0) -> Optional[str]:
     try:
         socket.inet_aton(host)
         return host
