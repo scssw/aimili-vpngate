@@ -212,6 +212,11 @@ def get_state() -> dict[str, Any]:
     state.setdefault("last_fetch_status", "not_started")
     state.setdefault("last_check_message", "")
     state.setdefault("blacklisted_nodes", 0)
+    state.setdefault("location_lock_enabled", False)
+    state.setdefault("location_lock_country", "")
+    state.setdefault("location_lock_country_short", "")
+    state.setdefault("location_lock_location", "")
+    state.setdefault("location_lock_label", "")
     
     # Pre-populate settings inputs in UI
     ui_cfg = load_ui_config()
@@ -596,6 +601,68 @@ def sort_all_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     )
     return available_nodes + untested_nodes + unavailable_nodes
 
+def normalize_location_value(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip()).casefold()
+
+def get_location_lock() -> dict[str, Any]:
+    state = get_state()
+    return {
+        "enabled": bool(state.get("location_lock_enabled")),
+        "country": str(state.get("location_lock_country") or ""),
+        "country_short": str(state.get("location_lock_country_short") or ""),
+        "location": str(state.get("location_lock_location") or ""),
+        "label": str(state.get("location_lock_label") or ""),
+    }
+
+def location_lock_label_for_node(node: dict[str, Any]) -> str:
+    return str(node.get("location") or node.get("country") or node.get("country_short") or "").strip()
+
+def set_location_lock_from_node(node: dict[str, Any]) -> None:
+    label = location_lock_label_for_node(node)
+    set_state(
+        location_lock_enabled=True,
+        location_lock_country=str(node.get("country") or ""),
+        location_lock_country_short=str(node.get("country_short") or ""),
+        location_lock_location=str(node.get("location") or ""),
+        location_lock_label=label,
+        last_check_message=f"已锁定自动切换地区: {label or '当前节点地区'}",
+    )
+
+def clear_location_lock() -> None:
+    set_state(
+        location_lock_enabled=False,
+        location_lock_country="",
+        location_lock_country_short="",
+        location_lock_location="",
+        location_lock_label="",
+        last_check_message="已取消自动切换地区锁定",
+    )
+
+def node_matches_location_lock(node: dict[str, Any], location_lock: dict[str, Any] | None = None, strict_location: bool = True) -> bool:
+    location_lock = location_lock or get_location_lock()
+    if not location_lock.get("enabled"):
+        return True
+
+    lock_country_short = normalize_location_value(location_lock.get("country_short"))
+    node_country_short = normalize_location_value(node.get("country_short"))
+    if lock_country_short and node_country_short and lock_country_short != node_country_short:
+        return False
+
+    lock_country = normalize_location_value(location_lock.get("country"))
+    node_country = normalize_location_value(node.get("country"))
+    if lock_country and node_country and lock_country != node_country:
+        return False
+
+    lock_location = normalize_location_value(location_lock.get("location"))
+    if not lock_location:
+        return True
+
+    node_location = normalize_location_value(node.get("location"))
+    if node_location:
+        return node_location == lock_location
+
+    return not strict_location
+
 active_test_indexes = set()
 test_indexes_lock = threading.Lock()
 
@@ -774,12 +841,14 @@ def auto_switch_node(attempt: int = 0) -> None:
         return
         
     # Find the next best available node
+    location_lock = get_location_lock()
     with lock:
         nodes = read_json(NODES_FILE, [])
         candidates = [
             n for n in nodes 
             if n.get("probe_status") == "available" 
             and not n.get("active")
+            and node_matches_location_lock(n, location_lock, strict_location=True)
         ]
         candidates.sort(key=lambda n: (parse_int(n.get("latency_ms")) or 999999, -parse_int(n.get("score"))))
         
@@ -789,7 +858,7 @@ def auto_switch_node(attempt: int = 0) -> None:
         print(f"[自动切换] {msg}", flush=True)
         log_to_json("INFO", "VPN", msg)
         try:
-            connect_node(next_node["id"])
+            connect_node(next_node["id"], update_location_lock=False)
         except Exception as e:
             err_msg = f"切换到备用节点 {next_node['id']} 失败: {e}，将尝试下一个..."
             print(f"[自动切换] {err_msg}", flush=True)
@@ -816,7 +885,7 @@ def auto_switch_node(attempt: int = 0) -> None:
         
         threading.Thread(target=bg_fetch_and_switch, daemon=True).start()
 
-def connect_node(node_id: str) -> str:
+def connect_node(node_id: str, update_location_lock: bool = False) -> str:
     global active_openvpn_process, active_openvpn_node_id, is_connecting
     with lock:
         if is_connecting:
@@ -889,6 +958,8 @@ def connect_node(node_id: str) -> str:
             if item["active"]:
                 item["probe_message"] = f"Active node. HTTP proxy: http://{LOCAL_PROXY_HOST}:{LOCAL_PROXY_PORT}"
         write_json(NODES_FILE, nodes)
+        if update_location_lock and get_location_lock().get("enabled"):
+            set_location_lock_from_node(node)
         
         set_state(last_check_message="正在测试本地代理出站联通性与出口 IP...")
         res = check_proxy_health()
@@ -947,6 +1018,16 @@ def maintain_valid_nodes(force: bool = False) -> str:
             is_connecting = False
             return "没有拉取到新节点"
 
+        location_lock = get_location_lock()
+        if location_lock.get("enabled"):
+            candidates.sort(
+                key=lambda n: (
+                    0 if node_matches_location_lock(n, location_lock, strict_location=False) else 1,
+                    -parse_int(n.get("score")),
+                    parse_int(n.get("ping")),
+                )
+            )
+
         with lock:
             active_node = None
             if active_openvpn_node_id:
@@ -981,7 +1062,13 @@ def maintain_valid_nodes(force: bool = False) -> str:
         # Test the first 10 non-active nodes from the new list
         with lock:
             current_nodes = read_json(NODES_FILE, [])
-            to_test = [n for n in current_nodes if not n.get("active")][:10]
+            to_test_candidates = [n for n in current_nodes if not n.get("active")]
+            if location_lock.get("enabled"):
+                to_test_candidates = [
+                    n for n in to_test_candidates
+                    if node_matches_location_lock(n, location_lock, strict_location=False)
+                ]
+            to_test = to_test_candidates[:10]
             to_test_ids = [n["id"] for n in to_test]
             
         print(f"[维护线程] 正在检测新获取列表的前 10 个节点: {to_test_ids}", flush=True)
@@ -2097,6 +2184,10 @@ INDEX_HTML = r"""<!doctype html>
     <div id="status" class="status"><span class="status-dot"></span>服务加载中...</div>
   </div>
   <div class="btn-group">
+    <button id="location_lock" class="btn-primary" style="background: rgba(255, 255, 255, 0.08); border: 1px solid var(--border-color); color: var(--text-primary); max-width: 176px; white-space: nowrap;">
+      <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M12 11c1.657 0 3-1.343 3-3S13.657 5 12 5 9 6.343 9 8s1.343 3 3 3z" /><path stroke-linecap="round" stroke-linejoin="round" d="M19.5 8.5c0 5.25-7.5 12-7.5 12s-7.5-6.75-7.5-12a7.5 7.5 0 1115 0z" /></svg>
+      锁定位置
+    </button>
     <button id="refresh" class="btn-primary" style="background: var(--success-gradient);">
       <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 1121.21 8H18.5" /></svg>
       更新节点
@@ -2478,9 +2569,32 @@ function stableSortNodes() {
   });
 }
 
+function getLockDisplayLabel(activeNode) {
+  return state.location_lock_label || (activeNode ? (activeNode.location || translateCountry(activeNode.country) || activeNode.country_short || "") : "");
+}
+
+function renderLocationLockButton(activeNode) {
+  const btn = $("location_lock");
+  if (!btn) return;
+  const enabled = !!state.location_lock_enabled;
+  const label = getLockDisplayLabel(activeNode);
+  const shortLabel = label && label.length > 12 ? `${label.slice(0, 12)}...` : label;
+  const pinIcon = `<svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M12 11c1.657 0 3-1.343 3-3S13.657 5 12 5 9 6.343 9 8s1.343 3 3 3z" /><path stroke-linecap="round" stroke-linejoin="round" d="M19.5 8.5c0 5.25-7.5 12-7.5 12s-7.5-6.75-7.5-12a7.5 7.5 0 1115 0z" /></svg>`;
+  const lockIcon = `<svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M7 10V8a5 5 0 0110 0v2" /><rect x="5" y="10" width="14" height="10" rx="2" /><path stroke-linecap="round" stroke-linejoin="round" d="M12 14v2" /></svg>`;
+  btn.disabled = state.is_connecting || (!enabled && !activeNode);
+  btn.style.background = enabled ? "var(--warning-gradient)" : "rgba(255, 255, 255, 0.08)";
+  btn.style.border = enabled ? "none" : "1px solid var(--border-color)";
+  btn.style.color = enabled ? "white" : "var(--text-primary)";
+  btn.title = enabled
+    ? `自动切换已锁定在 ${label || "当前地区"}，点击取消`
+    : (activeNode ? `锁定自动切换到 ${label || "当前节点地区"}` : "连接节点后可锁定位置");
+  btn.innerHTML = `${enabled ? lockIcon : pinIcon}${enabled ? `已锁定 ${esc(shortLabel || "位置")}` : "锁定位置"}`;
+}
+
 function render(){
   const activeNodeId = state.active_openvpn_node_id;
   const activeNode = nodes.find(n => n.active || n.id === activeNodeId);
+  renderLocationLockButton(activeNode);
   
   // Render separated Active Node Card
   const activeCardContainer = $("active_node_card");
@@ -2871,6 +2985,37 @@ async function load(){
 
 $("search").oninput=()=>{ currentPage = 1; render(); };
 $("country_filter").onchange=()=>{ currentPage = 1; render(); };
+
+$("location_lock").onclick=async()=>{
+  const enable = !state.location_lock_enabled;
+  const activeNode = nodes.find(n => n.active || n.id === state.active_openvpn_node_id);
+  if (enable && !activeNode) {
+    alert("请先连接一个节点，再锁定位置");
+    return;
+  }
+
+  const btn = $("location_lock");
+  btn.disabled = true;
+  try {
+    const response = await fetch("./api/location_lock", {
+      method: "POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({enabled: enable})
+    });
+    const result = await response.json();
+    if (!result.ok) {
+      alert(result.error || "位置锁定设置失败");
+      return;
+    }
+    state = result.state || state;
+    render();
+  } catch(e) {
+    alert("位置锁定请求失败");
+  } finally {
+    btn.disabled = false;
+    render();
+  }
+};
 
 $("refresh").onclick=async()=>{ 
   $("refresh").disabled=true; 
@@ -3460,7 +3605,29 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
 
-        if effective_path == "/api/check":
+        if effective_path == "/api/location_lock":
+            try:
+                length = parse_int(self.headers.get("Content-Length"))
+                payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}") if length > 0 else {}
+                enabled = bool(payload.get("enabled"))
+                if not enabled:
+                    clear_location_lock()
+                    self.send_json({"ok": True, "state": get_state()})
+                    return
+
+                with lock:
+                    nodes = read_json(NODES_FILE, [])
+                    active_node = next((n for n in nodes if active_openvpn_node_id and n.get("id") == active_openvpn_node_id), None)
+
+                if not active_node:
+                    self.send_json({"ok": False, "error": "请先连接一个节点，再锁定位置"}, HTTPStatus.BAD_REQUEST)
+                    return
+
+                set_location_lock_from_node(active_node)
+                self.send_json({"ok": True, "state": get_state()})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        elif effective_path == "/api/check":
             try:
                 self.send_json({"ok": True, "message": maintain_valid_nodes(force=True)})
             except Exception as exc:
@@ -3499,7 +3666,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 length = parse_int(self.headers.get("Content-Length"))
                 payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
-                self.send_json({"ok": True, "message": connect_node(str(payload.get("id") or ""))})
+                self.send_json({"ok": True, "message": connect_node(str(payload.get("id") or ""), update_location_lock=True)})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/test_node":
@@ -3555,6 +3722,7 @@ class Tee:
 def main() -> None:
     ensure_dirs()
     kill_existing_openvpn_processes()
+    previous_state = read_json(STATE_FILE, {})
     
     log_file = DATA_DIR / "vpngate.log"
     tee = Tee(str(log_file))
@@ -3575,6 +3743,11 @@ def main() -> None:
             "is_connecting": True,
             "active_node_latency": "正在准备",
             "blacklisted_nodes": 0,
+            "location_lock_enabled": bool(previous_state.get("location_lock_enabled")),
+            "location_lock_country": previous_state.get("location_lock_country", ""),
+            "location_lock_country_short": previous_state.get("location_lock_country_short", ""),
+            "location_lock_location": previous_state.get("location_lock_location", ""),
+            "location_lock_label": previous_state.get("location_lock_label", ""),
         },
     )
     threading.Thread(target=proxy_server.start_proxy_server, args=(LOCAL_PROXY_HOST, LOCAL_PROXY_PORT), daemon=True).start()
