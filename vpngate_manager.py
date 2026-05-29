@@ -38,7 +38,10 @@ API_URL = "https://www.vpngate.net/api/iphone/"
 FETCH_INTERVAL_SECONDS = int(os.environ.get("FETCH_INTERVAL_SECONDS", "960"))
 CHECK_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL_SECONDS", "960"))
 TARGET_VALID_NODES = int(os.environ.get("TARGET_VALID_NODES", "3"))
-MAX_SCAN_ROWS = int(os.environ.get("MAX_SCAN_ROWS", "300"))
+MAX_SCAN_ROWS = int(os.environ.get("MAX_SCAN_ROWS", "1000"))
+NODE_TEST_BATCH_SIZE = int(os.environ.get("NODE_TEST_BATCH_SIZE", "20"))
+US_RESIDENTIAL_TARGET = int(os.environ.get("US_RESIDENTIAL_TARGET", "20"))
+US_RESIDENTIAL_COUNTRY_SHORT = os.environ.get("US_RESIDENTIAL_COUNTRY_SHORT", "US").upper()
 OPENVPN_TEST_TIMEOUT_SECONDS = int(os.environ.get("OPENVPN_TEST_TIMEOUT_SECONDS", "35"))
 OPENVPN_CMD = os.environ.get("OPENVPN_CMD", "openvpn")
 OPENVPN_AUTH_USER = os.environ.get("OPENVPN_AUTH_USER", "vpn")
@@ -206,6 +209,8 @@ def get_state() -> dict[str, Any]:
     state["is_connecting"] = is_connecting
     state.setdefault("api_url", API_URL)
     state.setdefault("target_valid_nodes", TARGET_VALID_NODES)
+    state.setdefault("us_residential_target", US_RESIDENTIAL_TARGET)
+    state.setdefault("us_residential_country_short", US_RESIDENTIAL_COUNTRY_SHORT)
     state.setdefault("fetch_interval_seconds", FETCH_INTERVAL_SECONDS)
     state.setdefault("check_interval_seconds", CHECK_INTERVAL_SECONDS)
     state.setdefault("local_proxy", f"http://{LOCAL_PROXY_HOST}:{LOCAL_PROXY_PORT}")
@@ -689,6 +694,41 @@ def node_matches_residential_ip_lock(node: dict[str, Any], enabled: Optional[boo
 
     return not strict_ip_type
 
+def is_target_us_node(node: dict[str, Any]) -> bool:
+    return normalize_location_value(node.get("country_short")) == normalize_location_value(US_RESIDENTIAL_COUNTRY_SHORT)
+
+def is_available_target_us_residential_node(node: dict[str, Any]) -> bool:
+    return (
+        is_target_us_node(node)
+        and is_residential_ip_node(node)
+        and node.get("probe_status") == "available"
+    )
+
+def count_available_target_us_residential_nodes(nodes: list[dict[str, Any]]) -> int:
+    return len([n for n in nodes if is_available_target_us_residential_node(n)])
+
+def merge_fetched_candidate(existing: Optional[dict[str, Any]], candidate: dict[str, Any]) -> dict[str, Any]:
+    if not existing:
+        return candidate
+
+    merged = candidate.copy()
+    for key in (
+        "owner",
+        "asn",
+        "as_name",
+        "location",
+        "ip_type",
+        "quality",
+        "latency_ms",
+        "probe_status",
+        "probe_message",
+        "probed_at",
+        "active",
+    ):
+        if existing.get(key) not in (None, ""):
+            merged[key] = existing[key]
+    return merged
+
 active_test_indexes = set()
 test_indexes_lock = threading.Lock()
 
@@ -1067,9 +1107,14 @@ def maintain_valid_nodes(force: bool = False) -> str:
 
         with lock:
             active_node = None
+            existing_by_id = {}
             if active_openvpn_node_id:
                 current_nodes = read_json(NODES_FILE, [])
+                existing_by_id = {n.get("id"): n for n in current_nodes if n.get("id")}
                 active_node = next((n for n in current_nodes if n.get("id") == active_openvpn_node_id), None)
+            else:
+                current_nodes = read_json(NODES_FILE, [])
+                existing_by_id = {n.get("id"): n for n in current_nodes if n.get("id")}
                 
             merged: list[dict[str, Any]] = []
             seen_ids: set[str] = set()
@@ -1080,7 +1125,7 @@ def maintain_valid_nodes(force: bool = False) -> str:
                 
             for cand in candidates:
                 if cand["id"] not in seen_ids:
-                    merged.append(cand)
+                    merged.append(merge_fetched_candidate(existing_by_id.get(cand["id"]), cand))
                     seen_ids.add(cand["id"])
                     
             if len(merged) > 1000:
@@ -1099,7 +1144,11 @@ def maintain_valid_nodes(force: bool = False) -> str:
         # Test the first 10 non-active nodes from the new list
         with lock:
             current_nodes = read_json(NODES_FILE, [])
-            to_test_candidates = [n for n in current_nodes if not n.get("active")]
+            available_us_residential = count_available_target_us_residential_nodes(current_nodes)
+            to_test_candidates = [
+                n for n in current_nodes
+                if not n.get("active") and n.get("probe_status") != "available"
+            ]
             if location_lock.get("enabled"):
                 to_test_candidates = [
                     n for n in to_test_candidates
@@ -1110,10 +1159,20 @@ def maintain_valid_nodes(force: bool = False) -> str:
                     n for n in to_test_candidates
                     if node_matches_residential_ip_lock(n, residential_ip_lock, strict_ip_type=False)
                 ]
-            to_test = to_test_candidates[:10]
+            if US_RESIDENTIAL_TARGET > 0 and available_us_residential < US_RESIDENTIAL_TARGET:
+                to_test_candidates.sort(
+                    key=lambda n: (
+                        0 if is_target_us_node(n) else 1,
+                        0 if n.get("probe_status") == "not_checked" else 1,
+                        0 if not normalize_location_value(n.get("ip_type")) else 1,
+                        -parse_int(n.get("score")),
+                        parse_int(n.get("ping")),
+                    )
+                )
+            to_test = to_test_candidates[:NODE_TEST_BATCH_SIZE]
             to_test_ids = [n["id"] for n in to_test]
             
-        print(f"[维护线程] 正在检测新获取列表的前 10 个节点: {to_test_ids}", flush=True)
+        print(f"[维护线程] 正在检测新获取列表的前 {NODE_TEST_BATCH_SIZE} 个节点: {to_test_ids}", flush=True)
         set_state(is_connecting=True, last_check_message="正在并发检测筛选可用节点，这可能需要 5-30 秒...")
         test_multiple_nodes(to_test_ids)
         
@@ -1133,6 +1192,7 @@ def maintain_valid_nodes(force: bool = False) -> str:
             last_check_message=message,
             active_openvpn_node_id=active_openvpn_node_id,
             valid_nodes=valid_nodes_count,
+            us_residential_nodes=count_available_target_us_residential_nodes(merged),
         )
         return message
     except Exception as e:
@@ -3829,6 +3889,8 @@ def main() -> None:
         {
             "api_url": API_URL,
             "target_valid_nodes": TARGET_VALID_NODES,
+            "us_residential_target": US_RESIDENTIAL_TARGET,
+            "us_residential_country_short": US_RESIDENTIAL_COUNTRY_SHORT,
             "fetch_interval_seconds": FETCH_INTERVAL_SECONDS,
             "check_interval_seconds": CHECK_INTERVAL_SECONDS,
             "local_proxy": f"http://{LOCAL_PROXY_HOST}:{LOCAL_PROXY_PORT}",
