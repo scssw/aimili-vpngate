@@ -51,6 +51,7 @@ LOCAL_PROXY_PORT = int(os.environ.get("LOCAL_PROXY_PORT", "7928"))
 UI_HOST = os.environ.get("UI_HOST", "0.0.0.0")
 UI_PORT = int(os.environ.get("UI_PORT", "8787"))
 INVALID_BACKOFF_SECONDS = int(os.environ.get("INVALID_BACKOFF_SECONDS", str(30 * 60)))
+AUTO_REPLENISH_COOLDOWN_SECONDS = int(os.environ.get("AUTO_REPLENISH_COOLDOWN_SECONDS", "60"))
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ["VPNGATE_DATA_DIR"]).resolve() if os.environ.get("VPNGATE_DATA_DIR") else ROOT_DIR / "vpngate_data"
@@ -66,6 +67,10 @@ active_openvpn_node_id = ""
 is_connecting = True
 last_active_ping_time = 0.0
 last_active_latency = 0
+maintain_nodes_lock = threading.Lock()
+auto_replenish_lock = threading.Lock()
+auto_replenish_in_progress = False
+last_auto_replenish_at = 0.0
 
 def ensure_dirs() -> None:
     DATA_DIR.mkdir(exist_ok=True)
@@ -665,7 +670,9 @@ def node_matches_location_lock(node: dict[str, Any], location_lock: Optional[dic
 
     node_location = normalize_location_value(node.get("location"))
     if node_location:
-        return node_location == lock_location
+        if strict_location:
+            return node_location == lock_location
+        return True
 
     return not strict_location
 
@@ -728,6 +735,56 @@ def merge_fetched_candidate(existing: Optional[dict[str, Any]], candidate: dict[
         if existing.get(key) not in (None, ""):
             merged[key] = existing[key]
     return merged
+
+def find_auto_switch_candidates(nodes: list[dict[str, Any]], location_lock: dict[str, Any], residential_ip_lock: bool) -> tuple[list[dict[str, Any]], bool]:
+    base_candidates = [
+        n for n in nodes
+        if n.get("probe_status") == "available"
+        and not n.get("active")
+        and node_matches_residential_ip_lock(n, residential_ip_lock, strict_ip_type=True)
+    ]
+
+    exact_candidates = [
+        n for n in base_candidates
+        if node_matches_location_lock(n, location_lock, strict_location=True)
+    ]
+    if exact_candidates or not location_lock.get("enabled") or not location_lock.get("location"):
+        exact_candidates.sort(key=lambda n: (parse_int(n.get("latency_ms")) or 999999, -parse_int(n.get("score"))))
+        return exact_candidates, False
+
+    relaxed_candidates = [
+        n for n in base_candidates
+        if node_matches_location_lock(n, location_lock, strict_location=False)
+    ]
+    relaxed_candidates.sort(key=lambda n: (parse_int(n.get("latency_ms")) or 999999, -parse_int(n.get("score"))))
+    return relaxed_candidates, bool(relaxed_candidates)
+
+def schedule_auto_replenish(reason: str = "") -> bool:
+    global auto_replenish_in_progress, last_auto_replenish_at
+    now = time.time()
+    with auto_replenish_lock:
+        if auto_replenish_in_progress:
+            print("[自动切换] 已有后台节点补齐任务在运行，跳过重复拉取", flush=True)
+            return False
+        if now - last_auto_replenish_at < AUTO_REPLENISH_COOLDOWN_SECONDS:
+            print("[自动切换] 后台节点补齐处于冷却期，跳过重复拉取", flush=True)
+            return False
+        auto_replenish_in_progress = True
+        last_auto_replenish_at = now
+
+    def bg_fetch_and_switch() -> None:
+        global auto_replenish_in_progress
+        try:
+            maintain_valid_nodes(force=False)
+            auto_switch_node()
+        except Exception as e:
+            print(f"[自动切换后台补齐] 获取并测试节点失败: {e}", flush=True)
+        finally:
+            with auto_replenish_lock:
+                auto_replenish_in_progress = False
+
+    threading.Thread(target=bg_fetch_and_switch, daemon=True).start()
+    return True
 
 active_test_indexes = set()
 test_indexes_lock = threading.Lock()
@@ -911,18 +968,12 @@ def auto_switch_node(attempt: int = 0) -> None:
     residential_ip_lock = get_residential_ip_lock()
     with lock:
         nodes = read_json(NODES_FILE, [])
-        candidates = [
-            n for n in nodes 
-            if n.get("probe_status") == "available" 
-            and not n.get("active")
-            and node_matches_location_lock(n, location_lock, strict_location=True)
-            and node_matches_residential_ip_lock(n, residential_ip_lock, strict_ip_type=True)
-        ]
-        candidates.sort(key=lambda n: (parse_int(n.get("latency_ms")) or 999999, -parse_int(n.get("score"))))
+        candidates, relaxed_location = find_auto_switch_candidates(nodes, location_lock, residential_ip_lock)
         
     if candidates:
         next_node = candidates[0]
-        msg = f"当前连接已失效或代理连通性检测失败，正在自动切换至最佳备用节点: {next_node['id']}"
+        relax_note = "（锁定城市暂无可用节点，已放宽到同国家/地区）" if relaxed_location else ""
+        msg = f"当前连接已失效或代理连通性检测失败，正在自动切换至最佳备用节点: {next_node['id']}{relax_note}"
         print(f"[自动切换] {msg}", flush=True)
         log_to_json("INFO", "VPN", msg)
         try:
@@ -944,14 +995,8 @@ def auto_switch_node(attempt: int = 0) -> None:
             write_json(NODES_FILE, nodes)
         set_state(active_openvpn_node_id="", last_check_message="没有可用的备选节点，已断开")
         
-        def bg_fetch_and_switch():
-            try:
-                maintain_valid_nodes(force=False)
-                auto_switch_node()
-            except Exception as e:
-                print(f"[自动切换后台补齐] 获取并测试节点失败: {e}", flush=True)
-        
-        threading.Thread(target=bg_fetch_and_switch, daemon=True).start()
+        if not schedule_auto_replenish("no_available_candidate"):
+            set_state(last_check_message="没有可用的备选节点，已跳过重复后台拉取")
 
 def connect_node(node_id: str, update_location_lock: bool = False) -> str:
     global active_openvpn_process, active_openvpn_node_id, is_connecting
@@ -1057,6 +1102,11 @@ def connect_node(node_id: str, update_location_lock: bool = False) -> str:
 def maintain_valid_nodes(force: bool = False) -> str:
     global active_openvpn_process, active_openvpn_node_id, is_connecting
     ensure_dirs()
+    if not maintain_nodes_lock.acquire(blocking=False):
+        msg = "节点维护任务已在运行，跳过重复请求"
+        print(f"[维护线程] {msg}", flush=True)
+        set_state(last_check_message=msg)
+        return msg
     is_connecting = True
     try:
         if force:
@@ -1084,6 +1134,7 @@ def maintain_valid_nodes(force: bool = False) -> str:
 
         if not candidates:
             is_connecting = False
+            maintain_nodes_lock.release()
             return "没有拉取到新节点"
 
         location_lock = get_location_lock()
@@ -1194,9 +1245,11 @@ def maintain_valid_nodes(force: bool = False) -> str:
             valid_nodes=valid_nodes_count,
             us_residential_nodes=count_available_target_us_residential_nodes(merged),
         )
+        maintain_nodes_lock.release()
         return message
     except Exception as e:
         is_connecting = False
+        maintain_nodes_lock.release()
         raise e
 
 
@@ -1447,15 +1500,23 @@ LOGIN_HTML = r"""<!DOCTYPE html>
       submitBtn.querySelector("span").textContent = "正在验证...";
       
       try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 10000);
         const response = await fetch("./api/login", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
+          credentials: "same-origin",
+          cache: "no-store",
+          signal: controller.signal,
           body: JSON.stringify({ username: uname, password: pwd })
         });
+        clearTimeout(timeoutId);
         
-        const data = await response.json();
+        const data = await response.json().catch(() => ({}));
         if (response.ok && data.ok) {
-          window.location.reload();
+          const redirectUrl = new URL(data.redirect || "./", window.location.href);
+          redirectUrl.searchParams.set("_login", Date.now().toString());
+          window.location.replace(redirectUrl.toString());
         } else {
           errorText.textContent = data.error || "账号或密码不正确，请重新输入";
           errorText.style.display = "block";
@@ -1463,7 +1524,7 @@ LOGIN_HTML = r"""<!DOCTYPE html>
           submitBtn.querySelector("span").textContent = "登录";
         }
       } catch (err) {
-        errorText.textContent = "连接服务器失败，请稍后重试";
+        errorText.textContent = err && err.name === "AbortError" ? "登录请求超时，请刷新页面后重试" : "连接服务器失败，请稍后重试";
         errorText.style.display = "block";
         submitBtn.disabled = false;
         submitBtn.querySelector("span").textContent = "登录";
@@ -3569,6 +3630,17 @@ class Handler(BaseHTTPRequestHandler):
     def send_json(self, data: Any, status: HTTPStatus = HTTPStatus.OK) -> None:
         self.send_bytes(json.dumps(data, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8", status)
 
+    def send_json_with_headers(self, data: Any, headers: dict[str, str], status: HTTPStatus = HTTPStatus.OK) -> None:
+        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        for key, value in headers.items():
+            self.send_header(key, value)
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self) -> None:
         effective_path = self.validate_path()
         if effective_path == "": return
@@ -3648,13 +3720,12 @@ class Handler(BaseHTTPRequestHandler):
                     token = uuid.uuid4().hex
                     with lock:
                         active_sessions[token] = time.time() + 30 * 24 * 3600
-                    self.send_response(HTTPStatus.OK)
-                    self.send_header("Content-Type", "application/json; charset=utf-8")
                     secret_path = self.get_secret_path()
                     cookie_path = f"/{secret_path}/" if secret_path else "/"
-                    self.send_header("Set-Cookie", f"session={token}; Path={cookie_path}; HttpOnly; SameSite=Lax; Max-Age=2592000")
-                    self.end_headers()
-                    self.wfile.write(json.dumps({"ok": True}).encode("utf-8"))
+                    self.send_json_with_headers(
+                        {"ok": True, "redirect": "./"},
+                        {"Set-Cookie": f"session={token}; Path={cookie_path}; HttpOnly; SameSite=Lax; Max-Age=2592000"},
+                    )
                 else:
                     self.send_json({"ok": False, "error": "用户名或密码不正确，请重新输入"}, HTTPStatus.FORBIDDEN)
             except Exception as exc:
