@@ -1515,7 +1515,6 @@ LOGIN_HTML = r"""<!DOCTYPE html>
         const data = await response.json().catch(() => ({}));
         if (response.ok && data.ok) {
           const redirectUrl = new URL(data.redirect || "./", window.location.href);
-          redirectUrl.searchParams.set("_login", Date.now().toString());
           window.location.replace(redirectUrl.toString());
         } else {
           errorText.textContent = data.error || "账号或密码不正确，请重新输入";
@@ -3602,16 +3601,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def validate_path(self) -> str:
         secret_path = self.get_secret_path()
+        request_path = urllib.parse.urlsplit(self.path).path
         if not secret_path:
-            return self.path
-        if self.path == f"/{secret_path}":
+            return request_path
+        if request_path == f"/{secret_path}":
             self.send_response(HTTPStatus.FOUND)
             self.send_header("Location", f"/{secret_path}/")
             self.end_headers()
             return ""
         prefix = f"/{secret_path}/"
-        if self.path.startswith(prefix):
-            return "/" + self.path[len(prefix):]
+        if request_path.startswith(prefix):
+            return "/" + request_path[len(prefix):]
         self.send_response(HTTPStatus.NOT_FOUND)
         self.end_headers()
         return ""
