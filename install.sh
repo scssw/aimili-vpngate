@@ -47,8 +47,8 @@ echo -e "${BLUE}        欢迎使用 AimiliVPN 一键源码部署与管理脚本
 echo -e "${BLUE}==========================================================${PLAIN}"
 
 # 3. Configure GitHub Repository URL
-# Default to the official repository (baoweise-bot/aimili-vpngate)
-DEFAULT_USER="baoweise-bot"
+# Default to the user's repository (scssw/aimili-vpngate)
+DEFAULT_USER="scssw"
 DEFAULT_REPO="aimili-vpngate"
 
 # Allow custom repository override via command line arguments
@@ -91,6 +91,16 @@ else
     if [ -d "${INSTALL_DIR}" ]; then
         echo -e "  -> 目录 ${INSTALL_DIR} 已存在，正在更新并强制覆盖本地源码..."
         cd "${INSTALL_DIR}"
+        if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+            current_origin="$(git remote get-url origin 2>/dev/null || true)"
+            if [ "${current_origin}" != "${GITHUB_URL}" ]; then
+                echo -e "  -> 将 origin 切换为 ${GITHUB_URL} ..."
+                git remote set-url origin "${GITHUB_URL}" || git remote add origin "${GITHUB_URL}"
+            fi
+        else
+            echo -e "${RED}错误: ${INSTALL_DIR} 已存在但不是 Git 仓库，无法从目标仓库更新。${PLAIN}"
+            exit 1
+        fi
         git fetch origin "${DEPLOY_BRANCH}" || true
         git checkout -B "${DEPLOY_BRANCH}" "origin/${DEPLOY_BRANCH}" || true
         echo -e "  -> 正在强制重置本地源码至 origin/${DEPLOY_BRANCH} ..."
