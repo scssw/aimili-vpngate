@@ -4270,6 +4270,9 @@ INDEX_HTML = r"""<!doctype html>
       </svg>
       收藏菜单
     </button>
+    <button id="btn_test_all_nodes" class="toolbar-btn" type="button" onclick="testAllNodes()" style="height: 42px; gap: 6px;">
+      一键检测全部节点
+    </button>
   </section>
   <div id="favorites_panel" style="display: none; background: rgba(22, 30, 49, 0.97); border: 1px solid var(--border-color); border-radius: 16px; padding: 20px; margin-bottom: 20px; animation: modalFadeIn 0.25s ease-out;">
     <div style="display: flex; flex-direction: column; gap: 16px;">
@@ -4614,6 +4617,7 @@ INDEX_HTML = r"""<!doctype html>
 <script>
 let nodes=[], state={}, testingNodeIds = new Set();
 const favoriteRequestIds = new Set();
+let testAllNodesInFlight = false;
 let disconnectInFlight = false;
 let currentPage = 1;
 const pageSize = 50;
@@ -5272,6 +5276,49 @@ async function testNode(btn, id, event){
     alert("节点检测失败: " + (e.message || "未知错误"));
   } finally {
     testingNodeIds.delete(id);
+    render();
+  }
+}
+
+async function testAllNodes() {
+  if (testAllNodesInFlight) return;
+  const nodeIds = Array.from(new Set(nodes.map(node => String(node && node.id || "").trim()).filter(Boolean)));
+  if (!nodeIds.length) {
+    alert("当前没有可检测的节点");
+    return;
+  }
+
+  const button = $("btn_test_all_nodes");
+  testAllNodesInFlight = true;
+  button.disabled = true;
+  let completed = 0;
+  let failed = 0;
+  try {
+    for (let offset = 0; offset < nodeIds.length; offset += 5) {
+      const batch = nodeIds.slice(offset, offset + 5);
+      button.textContent = `检测中 ${completed}/${nodeIds.length}`;
+      const response = await fetchWithTimeout("./api/test_nodes", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ids: batch })
+      }, 180000);
+      const result = await readJsonResponse(response, "批量检测节点失败");
+      if (result.ok && Array.isArray(result.nodes)) {
+        const updated = new Map(result.nodes.map(node => [node.id, node]));
+        nodes = nodes.map(node => updated.get(node.id) || node);
+        completed += batch.length;
+      } else {
+        failed += batch.length;
+      }
+      render();
+    }
+    alert(`全部节点检测完成：${completed} 个已完成${failed ? `，${failed} 个批次失败` : ""}。`);
+  } catch (error) {
+    alert(`一键检测中断（已完成 ${completed}/${nodeIds.length} 个）：${error.message || "未知错误"}`);
+  } finally {
+    testAllNodesInFlight = false;
+    button.disabled = false;
+    button.textContent = "一键检测全部节点";
     render();
   }
 }
