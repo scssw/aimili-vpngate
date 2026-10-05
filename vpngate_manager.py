@@ -4271,7 +4271,7 @@ INDEX_HTML = r"""<!doctype html>
       收藏菜单
     </button>
     <button id="btn_test_all_nodes" class="toolbar-btn" type="button" onclick="testAllNodes()" style="height: 42px; gap: 6px;">
-      一键检测全部节点
+      一键检测当前页
     </button>
   </section>
   <div id="favorites_panel" style="display: none; background: rgba(22, 30, 49, 0.97); border: 1px solid var(--border-color); border-radius: 16px; padding: 20px; margin-bottom: 20px; animation: modalFadeIn 0.25s ease-out;">
@@ -5282,9 +5282,9 @@ async function testNode(btn, id, event){
 
 async function testAllNodes() {
   if (testAllNodesInFlight) return;
-  const nodeIds = Array.from(new Set(nodes.map(node => String(node && node.id || "").trim()).filter(Boolean)));
+  const nodeIds = Array.from(new Set(currentPageNodes.map(node => String(node && node.id || "").trim()).filter(Boolean)));
   if (!nodeIds.length) {
-    alert("当前没有可检测的节点");
+    alert("当前页没有可检测的节点");
     return;
   }
 
@@ -5312,13 +5312,13 @@ async function testAllNodes() {
       }
       render();
     }
-    alert(`全部节点检测完成：${completed} 个已完成${failed ? `，${failed} 个批次失败` : ""}。`);
+    alert(`当前页检测完成：${completed} 个已完成${failed ? `，${failed} 个批次失败` : ""}。`);
   } catch (error) {
-    alert(`一键检测中断（已完成 ${completed}/${nodeIds.length} 个）：${error.message || "未知错误"}`);
+    alert(`当前页检测中断（已完成 ${completed}/${nodeIds.length} 个）：${error.message || "未知错误"}`);
   } finally {
     testAllNodesInFlight = false;
     button.disabled = false;
-    button.textContent = "一键检测全部节点";
+    button.textContent = "一键检测当前页";
     render();
   }
 }
